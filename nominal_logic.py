@@ -425,7 +425,7 @@ def missing_nominal_key(line: ParsedLine) -> str:
 
 def apply_missing_nominals(lines: List[ParsedLine], corrections: Dict[str, str]) -> None:
     for line in lines:
-        if line.is_other and not line.nominal_code:
+        if line.is_other:
             saved = clean_nominal(corrections.get(missing_nominal_key(line), ""))
             if saved:
                 line.nominal_code = saved

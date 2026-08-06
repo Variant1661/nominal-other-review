@@ -310,6 +310,31 @@ def save_correction_staff_nominals(df: pd.DataFrame, lines: List[ParsedLine], co
     return []
 
 
+def save_review_nominal_overrides(df: pd.DataFrame, corrections: Dict[str, str]) -> List[str]:
+    errors: List[str] = []
+    updates: Dict[str, str] = {}
+
+    for _, row in df.iterrows():
+        key = str(row.get("Correction Key", ""))
+        if not key:
+            continue
+        code = clean_nominal(row.get("Payroll Nominal", ""))
+        original_code = clean_nominal(row.get("Original Payroll Nominal", ""))
+        if code == original_code:
+            continue
+        ok, cleaned_or_error = validate_nominal(code)
+        if not ok:
+            errors.append(f"{row.get('Staff Name')}: {cleaned_or_error}")
+            continue
+        updates[key] = cleaned_or_error
+
+    if errors:
+        return errors
+
+    corrections.update(updates)
+    return []
+
+
 def staff_base_df(base: Dict[str, Dict[str, object]], mapping: Dict[str, str]) -> pd.DataFrame:
     rows = []
     for key, item in sorted(base.items(), key=lambda kv: str(kv[1].get("staff_name", "")).lower()):
@@ -517,6 +542,7 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
     base_table = staff_base_df(base, mapping)
     missing_base = base_table[base_table["Base Home"].astype(str).str.strip() == ""] if not base_table.empty else pd.DataFrame()
     review_df, transfer_df, nominal_df, staff_df = build_review_rows(lines, base, mapping)
+    correction_key_by_row = {line.row_no: missing_nominal_key(line) for line in review_lines(lines)}
     missing_staff = missing_staff_df(lines, st.session_state.corrections, mapping)
     missing_detail = missing_rows_df(lines, st.session_state.corrections, mapping)
     correction_staff = correction_staff_df(lines, st.session_state.corrections, mapping)
@@ -642,7 +668,52 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
         elif view == "Nominal Summary":
             st.dataframe(nominal_df, use_container_width=True, hide_index=True, height=dataframe_height(nominal_df))
         else:
-            st.dataframe(review_df, use_container_width=True, hide_index=True, height=dataframe_height(review_df, maximum=640))
+            editable_review = review_df.copy()
+            if not editable_review.empty:
+                editable_review["Original Payroll Nominal"] = editable_review["Payroll Nominal"]
+                editable_review["Correction Key"] = editable_review["Row No"].map(correction_key_by_row)
+            edited_review = st.data_editor(
+                editable_review,
+                hide_index=True,
+                use_container_width=True,
+                height=dataframe_height(editable_review, maximum=640),
+                disabled=[
+                    "Status",
+                    "Staff Name",
+                    "Period",
+                    "Cost Type",
+                    "Other Category",
+                    "Payroll Nominal Home",
+                    "Base Nominal",
+                    "Base Home",
+                    "Transfer From",
+                    "Transfer To",
+                    "Amount",
+                    "Debit",
+                    "Credit",
+                    "Description",
+                    "Reference",
+                    "Row No",
+                    "Base Source",
+                    "Confidence",
+                ],
+                column_config={
+                    "Payroll Nominal": st.column_config.TextColumn("Payroll Nominal", help="Change this before generating the final workbook."),
+                    "Original Payroll Nominal": None,
+                    "Correction Key": None,
+                    "Amount": st.column_config.NumberColumn("Amount", format="%.2f"),
+                    "Debit": st.column_config.NumberColumn("Debit", format="%.2f"),
+                    "Credit": st.column_config.NumberColumn("Credit", format="%.2f"),
+                },
+                key="review_nominal_editor",
+            )
+            if st.button("Save payroll nominal changes", type="primary"):
+                errors = save_review_nominal_overrides(edited_review, st.session_state.corrections)
+                if errors:
+                    st.error("\n".join(errors))
+                else:
+                    st.success("Payroll nominal changes saved. Transfer summary will update now.")
+                    st.rerun()
 
     with generate_tab:
         render_section("Generate workbook", "When the work queue is clear, generate and download the Excel review report.")
