@@ -23,7 +23,15 @@ from department_costing import (  # noqa: E402
     validate_rules,
     write_costing_workbook,
 )
-from nominal_logic import DEFAULT_HOME_MAPPING  # noqa: E402
+from nominal_logic import (  # noqa: E402
+    DEFAULT_HOME_MAPPING,
+    apply_missing_nominals,
+    build_review_rows,
+    final_transfer_table,
+    infer_staff_base,
+    load_staff_master,
+    read_lines,
+)
 
 st.set_page_config(page_title="Department Costing", layout="wide")
 st.title("Department costing - transfer between homes")
@@ -63,13 +71,34 @@ with tempfile.TemporaryDirectory() as tmp:
     tmp_dir = Path(tmp)
     try:
         lines, no_code = read_cost_lines(save(payroll_file, tmp_dir, "payroll"), mapping)
-        master, master_df = load_master_roles(save(master_file, tmp_dir, "master") if master_file else None)
+        master_path = save(master_file, tmp_dir, "master") if master_file else None
+        master, master_df = load_master_roles(master_path)
+        # Regular OTHER-line transfers, using the same saved corrections / base overrides
+        # as the main page (they live in the shared session).
+        other_lines = read_lines(save(payroll_file, tmp_dir, "payroll_other"))
+        for ln in other_lines:
+            ln.source_file = payroll_file.name
+        apply_missing_nominals(other_lines, st.session_state.get("corrections", {}))
+        base = infer_staff_base(other_lines, mapping, load_staff_master(master_path, mapping), st.session_state.get("overrides", {}))
+        review_df, transfer_df, _, _ = build_review_rows(other_lines, base, mapping)
     except Exception as exc:  # shown to the user, nothing is silently skipped
         st.error(f"Could not read the files: {exc}")
         st.stop()
 
 if not master_file:
     st.warning("No staff master uploaded: job-role rules and person rules by name cannot be matched.")
+
+# ------------------------------------------------- regular OTHER-line transfers
+st.subheader("Final transfers (regular OTHER lines)")
+final_df = final_transfer_table(transfer_df)
+unresolved = review_df[review_df["Status"].astype(str).str.startswith("REVIEW")] if not review_df.empty else review_df
+if len(unresolved):
+    st.warning(
+        f"{len(unresolved)} OTHER line(s), \u00a3{unresolved['Amount'].sum():,.2f} in total, are unresolved (blank nominal or base home) "
+        "and are NOT in this table. Resolve them on the main page first, then come back."
+    )
+st.dataframe(final_df, hide_index=True, width="stretch")
+already_moved = set(review_df.loc[review_df["Status"] == "TRANSFER_TO_OTHER_HOME", "Row No"].astype(int)) if not review_df.empty else set()
 
 # ------------------------------------------------------------- default rules
 if "dc_rules" not in st.session_state:
@@ -165,8 +194,11 @@ with st.expander("Department suffix reference (editable meaning is documentation
     st.caption("Suffix = nominal code without its first digit, e.g. 205 = Crescent (2) + suffix 05 (Kitchen).")
 
 # ------------------------------------------------------------------ results
-st.subheader("2. Result")
-result = build_costing(lines, current, mapping, master)
+st.subheader("2. Result of the new rules (kept separate from the final transfers above)")
+skip_moved = st.checkbox(
+    "Leave out lines already moved by an OTHER-line transfer (prevents moving a line twice)", value=True,
+    help="Untick only if those lines should also be re-split by the rules. The Warnings list shows how many are affected.")
+result = build_costing(lines, current, mapping, master, exclude_rows=already_moved if skip_moved else None)
 jr, summary = result["journal"], result["summary"]
 m1, m2, m3 = st.columns(3)
 m1.metric("Payroll lines read", f"{len(lines):,}")
@@ -179,15 +211,15 @@ if not result["warnings"].empty:
     st.warning("Check these before posting:")
     st.dataframe(result["warnings"], hide_index=True, width="stretch")
 
-tab_sum, tab_j, tab_d, tab_p = st.tabs(["Transfer summary", "Journal", "Allocation detail", "Staff included"])
-tab_sum.dataframe(summary, hide_index=True, width="stretch")
+tab_sum, tab_j, tab_d, tab_p = st.tabs(["Rule transfers", "Journal", "Allocation detail", "Staff included"])
+tab_sum.dataframe(result["rule_table"], hide_index=True, width="stretch")
 tab_j.dataframe(jr, hide_index=True, width="stretch")
 tab_d.dataframe(result["detail"], hide_index=True, width="stretch")
 tab_p.dataframe(result["people"], hide_index=True, width="stretch")
 
 if st.button("Build Excel report", type="primary"):
     with tempfile.TemporaryDirectory() as tmp:
-        out = write_costing_workbook(Path(tmp) / "department_costing.xlsx", result, current, no_code, mapping)
+        out = write_costing_workbook(Path(tmp) / "department_costing.xlsx", result, current, no_code, mapping, final_transfers=final_df)
         st.session_state.dc_report = out.read_bytes()
 if st.session_state.get("dc_report"):
     st.download_button("Download Excel report", st.session_state.dc_report, "department_costing.xlsx",

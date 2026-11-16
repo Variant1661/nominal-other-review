@@ -58,3 +58,10 @@ Tests use fictional data only.
 - Shares are normalised, so percentages and days both work. Rules can be saved/loaded as JSON.
 - Output: net journal (credit nominal -> debit nominal per cost type), allocation detail, staff included, and warnings. Lines with no nominal code are listed, never allocated.
 - Payroll names ("Surname Forename X") are matched to the staff master by words; an ambiguous or unmatched name is flagged, not guessed.
+
+## Final transfers sheet
+
+Both workbooks now start with a `Final_Transfers` sheet in the layout shared with Finance:
+`Period | Transfer From | Transfer To | NIC | Wages` (a cost type with no movement is left blank).
+The department costing workbook keeps the new rules separate (`Rule_Transfers`, `Rule_Summary`, `Journal`, ...).
+Lines already moved by an OTHER-line transfer are left out of the rules by default so nothing is moved twice (a checkbox on the page turns this off).
