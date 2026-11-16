@@ -33,6 +33,22 @@ The Dashboard tab updates live as corrections are saved.
 
 This app processes uploaded files in memory/session temp storage and returns an Excel report for download. For payroll data, deploy inside an approved company environment or restrict access to approved users.
 
+## Behaviour notes
+
+- A payroll row with no Code is never given the nominal of the row above; it appears in the Missing Nominals queue.
+- Amounts are signed (debit minus credit), so reversals reduce transfer totals.
+- Correction keys include the source file and row number, so identical lines are corrected independently.
+- Staff base homes that are blank or on an unmapped nominal prefix block report generation.
+- A generated report is only offered for download while it still matches the current inputs.
+
+## Tests
+
+```
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest
+```
+Tests use fictional data only.
+
 ## Department costing page
 
 `pages/1_Department_Costing.py` (logic in `department_costing.py`) re-splits cost between homes after wages are posted.

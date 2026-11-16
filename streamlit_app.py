@@ -13,17 +13,28 @@ from nominal_logic import (
     ParsedLine,
     apply_missing_nominals,
     build_review_rows,
-    clean_nominal,
     default_output_name,
     infer_staff_base,
     load_staff_master,
     missing_nominal_key,
     nominal_dropdown_options,
-    nominal_home,
     read_lines,
     review_lines,
-    validate_nominal,
     write_output,
+)
+from review_helpers import (
+    correction_rows_df,
+    correction_staff_df,
+    mapping_text,
+    missing_rows_df,
+    missing_staff_df,
+    parse_mapping,
+    save_correction_staff_nominals,
+    save_missing_staff_nominals,
+    save_review_nominal_overrides,
+    save_staff_overrides_from_df,
+    staff_base_df,
+    unusable_base_homes,
 )
 
 
@@ -130,32 +141,33 @@ def uploaded_signature(uploaded_file: object) -> str:
     return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
 
 
-def save_uploaded_file(uploaded_file: object, folder: Path, stem: str) -> Path:
-    suffix = Path(uploaded_file.name).suffix or ".xlsx"
-    path = folder / f"{stem}{suffix}"
-    path.write_bytes(uploaded_file.getvalue())
-    return path
+@st.cache_data(show_spinner=False)
+def parse_payroll(data: bytes, name: str) -> List[ParsedLine]:
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / f"payroll{Path(name).suffix or '.xlsx'}"
+        path.write_bytes(data)
+        lines = read_lines(path)
+    for line in lines:
+        line.source_file = name
+    return lines
 
 
-def parse_mapping(text: str) -> Dict[str, str]:
-    mapping: Dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if "=" not in line:
-            raise ValueError(f"Invalid mapping line: {line}. Use format 2=CRE.")
-        left, right = [part.strip() for part in line.split("=", 1)]
-        if not left.isdigit() or len(left) != 1:
-            raise ValueError(f"Invalid nominal prefix: {left}. Use one digit, for example 5=BUN.")
-        if not right.isalpha() or not (2 <= len(right) <= 5):
-            raise ValueError(f"Invalid home code: {right}. Use short codes like CRE, PET, ATW.")
-        mapping[left] = right.upper()
-    return mapping
+@st.cache_data(show_spinner=False)
+def parse_master(data: bytes, name: str, mapping_key: str):
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / f"staff_master{Path(name).suffix or '.xlsx'}"
+        path.write_bytes(data)
+        return load_staff_master(path, parse_mapping(mapping_key))
 
 
-def mapping_text(mapping: Dict[str, str]) -> str:
-    return "\n".join(f"{k}={v}" for k, v in sorted(mapping.items()))
+def report_signature(review_df: pd.DataFrame, mapping_key: str) -> str:
+    """Identifies exactly what a generated workbook was built from."""
+    h = hashlib.sha256()
+    h.update(review_df.to_csv(index=False).encode())
+    h.update(mapping_key.encode())
+    h.update(repr(sorted(st.session_state.corrections.items())).encode())
+    h.update(repr(sorted(st.session_state.overrides.items())).encode())
+    return h.hexdigest()
 
 
 def reset_for_new_payroll(sig: str) -> None:
@@ -168,215 +180,10 @@ def reset_for_new_payroll(sig: str) -> None:
     st.session_state.report_name = None
 
 
-def missing_rows_df(lines: List[ParsedLine], corrections: Dict[str, str], mapping: Dict[str, str]) -> pd.DataFrame:
-    rows = []
-    for line in review_lines(lines):
-        if line.nominal_code:
-            continue
-        key = missing_nominal_key(line)
-        code = clean_nominal(corrections.get(key, ""))
-        rows.append({
-            "Key": key,
-            "Staff Key": line.staff_key,
-            "Row No": line.row_no,
-            "Staff Name": line.staff_name,
-            "Period": line.period,
-            "Cost Type": "NIC" if line.is_nic else "WAGES",
-            "Other Category": line.category,
-            "Amount": round(abs(line.amount), 2),
-            "Nominal": code,
-            "Home": nominal_home(code, mapping) if code else "",
-            "Description": line.description,
-        })
-    return pd.DataFrame(rows)
-
-
-def missing_staff_df(lines: List[ParsedLine], corrections: Dict[str, str], mapping: Dict[str, str]) -> pd.DataFrame:
-    missing = missing_rows_df(lines, corrections, mapping)
-    if missing.empty:
-        return pd.DataFrame(columns=["Staff Key", "Staff Name", "Rows", "Categories", "Cost Types", "Total Amount", "Nominal", "Home", "Row Nos"])
-
-    rows = []
-    for staff, group in missing.groupby("Staff Key", sort=True):
-        codes = [clean_nominal(v) for v in group["Nominal"].tolist() if clean_nominal(v)]
-        code = codes[0] if codes else ""
-        rows.append({
-            "Staff Key": staff,
-            "Staff Name": group["Staff Name"].iloc[0],
-            "Rows": int(len(group)),
-            "Categories": ", ".join(sorted(set(group["Other Category"].astype(str)))),
-            "Cost Types": ", ".join(sorted(set(group["Cost Type"].astype(str)))),
-            "Total Amount": round(float(group["Amount"].sum()), 2),
-            "Nominal": code,
-            "Home": nominal_home(code, mapping) if code else "",
-            "Row Nos": ", ".join(str(v) for v in sorted(group["Row No"].tolist())),
-        })
-    return pd.DataFrame(rows).sort_values("Staff Name")
-
-
-def correction_rows_df(lines: List[ParsedLine], corrections: Dict[str, str], mapping: Dict[str, str]) -> pd.DataFrame:
-    rows = []
-    for line in review_lines(lines):
-        key = missing_nominal_key(line)
-        if key not in corrections:
-            continue
-        code = clean_nominal(corrections.get(key, ""))
-        rows.append({
-            "Key": key,
-            "Staff Key": line.staff_key,
-            "Row No": line.row_no,
-            "Staff Name": line.staff_name,
-            "Period": line.period,
-            "Cost Type": "NIC" if line.is_nic else "WAGES",
-            "Other Category": line.category,
-            "Amount": round(abs(line.amount), 2),
-            "Nominal": code,
-            "Home": nominal_home(code, mapping) if code else "",
-            "Description": line.description,
-        })
-    return pd.DataFrame(rows)
-
-
-def correction_staff_df(lines: List[ParsedLine], corrections: Dict[str, str], mapping: Dict[str, str]) -> pd.DataFrame:
-    details = correction_rows_df(lines, corrections, mapping)
-    if details.empty:
-        return pd.DataFrame(columns=["Staff Key", "Staff Name", "Rows", "Categories", "Cost Types", "Total Amount", "Nominal", "Home", "Row Nos"])
-
-    rows = []
-    for staff, group in details.groupby("Staff Key", sort=True):
-        codes = [clean_nominal(v) for v in group["Nominal"].tolist() if clean_nominal(v)]
-        code = codes[0] if codes else ""
-        rows.append({
-            "Staff Key": staff,
-            "Staff Name": group["Staff Name"].iloc[0],
-            "Rows": int(len(group)),
-            "Categories": ", ".join(sorted(set(group["Other Category"].astype(str)))),
-            "Cost Types": ", ".join(sorted(set(group["Cost Type"].astype(str)))),
-            "Total Amount": round(float(group["Amount"].sum()), 2),
-            "Nominal": code,
-            "Home": nominal_home(code, mapping) if code else "",
-            "Row Nos": ", ".join(str(v) for v in sorted(group["Row No"].tolist())),
-        })
-    return pd.DataFrame(rows).sort_values("Staff Name")
-
-
-def save_missing_staff_nominals(df: pd.DataFrame, lines: List[ParsedLine], corrections: Dict[str, str]) -> List[str]:
-    errors: List[str] = []
-    code_by_staff: Dict[str, str] = {}
-
-    for _, row in df.iterrows():
-        code = clean_nominal(row.get("Nominal", ""))
-        if not code:
-            continue
-        ok, cleaned_or_error = validate_nominal(code)
-        if not ok:
-            errors.append(f"{row.get('Staff Name')}: {cleaned_or_error}")
-            continue
-        code_by_staff[str(row["Staff Key"])] = cleaned_or_error
-
-    if errors:
-        return errors
-
-    for line in review_lines(lines):
-        if line.nominal_code:
-            continue
-        code = code_by_staff.get(line.staff_key)
-        if code:
-            corrections[missing_nominal_key(line)] = code
-    return []
-
-
-def save_correction_staff_nominals(df: pd.DataFrame, lines: List[ParsedLine], corrections: Dict[str, str]) -> List[str]:
-    errors: List[str] = []
-    code_by_staff: Dict[str, str] = {}
-
-    for _, row in df.iterrows():
-        code = clean_nominal(row.get("Nominal", ""))
-        if not code:
-            continue
-        ok, cleaned_or_error = validate_nominal(code)
-        if not ok:
-            errors.append(f"{row.get('Staff Name')}: {cleaned_or_error}")
-            continue
-        code_by_staff[str(row["Staff Key"])] = cleaned_or_error
-
-    if errors:
-        return errors
-
-    for line in review_lines(lines):
-        key = missing_nominal_key(line)
-        if key in corrections and line.staff_key in code_by_staff:
-            corrections[key] = code_by_staff[line.staff_key]
-    return []
-
-
-def save_review_nominal_overrides(
-    df: pd.DataFrame,
-    corrections: Dict[str, str],
-    correction_key_by_row: Dict[int, str],
-    original_nominal_by_row: Dict[int, str],
-) -> List[str]:
-    errors: List[str] = []
-    updates: Dict[str, str] = {}
-
-    for _, row in df.iterrows():
-        row_no_text = clean_nominal(row.get("Row No", ""))
-        row_no = int(row_no_text) if row_no_text else 0
-        key = correction_key_by_row.get(row_no, "")
-        if not key:
-            continue
-        code = clean_nominal(row.get("Payroll Nominal", ""))
-        original_code = clean_nominal(original_nominal_by_row.get(row_no, ""))
-        if code == original_code:
-            continue
-        ok, cleaned_or_error = validate_nominal(code)
-        if not ok:
-            errors.append(f"{row.get('Staff Name')}: {cleaned_or_error}")
-            continue
-        updates[key] = cleaned_or_error
-
-    if errors:
-        return errors
-
-    corrections.update(updates)
-    return []
-
-
 def clear_generated_report() -> None:
     st.session_state.report_bytes = None
     st.session_state.report_name = None
-
-
-def staff_base_df(base: Dict[str, Dict[str, object]], mapping: Dict[str, str]) -> pd.DataFrame:
-    rows = []
-    for key, item in sorted(base.items(), key=lambda kv: str(kv[1].get("staff_name", "")).lower()):
-        base_nominal = clean_nominal(item.get("base_nominal", ""))
-        base_home = str(item.get("base_home", "")) or nominal_home(base_nominal, mapping)
-        rows.append({
-            "Staff Key": key,
-            "Staff Name": item.get("staff_name", ""),
-            "Base Nominal": base_nominal,
-            "Base Home": base_home,
-            "Source": item.get("source", ""),
-            "Confidence": item.get("confidence", ""),
-            "Employee Code": item.get("employee_code", ""),
-            "Department": item.get("department", ""),
-        })
-    return pd.DataFrame(rows)
-
-
-def save_staff_overrides_from_df(df: pd.DataFrame, overrides: Dict[str, str]) -> List[str]:
-    errors: List[str] = []
-    for _, row in df.iterrows():
-        code = clean_nominal(row.get("Base Nominal", ""))
-        if not code:
-            continue
-        ok, cleaned_or_error = validate_nominal(code)
-        if not ok:
-            errors.append(f"{row.get('Staff Name')}: {cleaned_or_error}")
-            continue
-        overrides[str(row["Staff Key"])] = cleaned_or_error
-    return errors
+    st.session_state.report_sig = None
 
 
 def render_header() -> None:
@@ -494,6 +301,8 @@ if "report_bytes" not in st.session_state:
     st.session_state.report_bytes = None
 if "report_name" not in st.session_state:
     st.session_state.report_name = None
+if "report_sig" not in st.session_state:
+    st.session_state.report_sig = None
 
 with st.sidebar:
     if LOGO_PATH.exists():
@@ -529,11 +338,9 @@ reset_for_new_payroll(uploaded_signature(payroll_file))
 
 with tempfile.TemporaryDirectory() as temp_dir_name:
     temp_dir = Path(temp_dir_name)
-    payroll_path = save_uploaded_file(payroll_file, temp_dir, "payroll")
-    master_path = save_uploaded_file(master_file, temp_dir, "staff_master") if master_file else None
 
     try:
-        lines = read_lines(payroll_path)
+        lines = parse_payroll(payroll_file.getvalue(), payroll_file.name)
         other_lines = review_lines(lines)
         if not other_lines:
             st.error("No OTHER or Employer NIC on OTHER lines were found in the payroll report.")
@@ -545,14 +352,14 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
     apply_missing_nominals(lines, st.session_state.corrections)
 
     try:
-        staff_master = load_staff_master(master_path, mapping)
+        staff_master = parse_master(master_file.getvalue(), master_file.name, st.session_state.mapping_text) if master_file else {}
     except Exception as exc:
         st.error(f"Could not read staff master file: {exc}")
         st.stop()
 
     base = infer_staff_base(lines, mapping, staff_master, st.session_state.overrides)
     base_table = staff_base_df(base, mapping)
-    missing_base = base_table[base_table["Base Home"].astype(str).str.strip() == ""] if not base_table.empty else pd.DataFrame()
+    missing_base = unusable_base_homes(base_table)
     review_df, transfer_df, nominal_df, staff_df = build_review_rows(lines, base, mapping)
     correction_key_by_row = {line.row_no: missing_nominal_key(line) for line in review_lines(lines)}
     original_nominal_by_row = {line.row_no: line.nominal_code for line in review_lines(lines)}
@@ -574,7 +381,7 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
     if unknown_prefixes:
         blockers.append("Unmapped prefix " + ", ".join(unknown_prefixes))
     if not missing_base.empty:
-        blockers.append(f"{len(missing_base)} base homes")
+        blockers.append(f"{len(missing_base)} base homes missing or unmapped")
     if not unresolved.empty and missing_staff.empty and missing_base.empty:
         blockers.append(f"{len(unresolved)} review rows")
     ready = not blockers and unresolved.empty
@@ -639,7 +446,7 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
                 key="correction_staff_editor",
             )
             if st.button("Update saved staff corrections"):
-                errors = save_correction_staff_nominals(edited_correction_staff, lines, st.session_state.corrections)
+                errors = save_correction_staff_nominals(edited_correction_staff, lines, st.session_state.corrections, correction_staff)
                 if errors:
                     st.error("\n".join(errors))
                 else:
@@ -659,14 +466,14 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
             hide_index=True,
             use_container_width=True,
             height=dataframe_height(base_table),
-            disabled=["Staff Key", "Staff Name", "Base Home", "Source", "Confidence", "Employee Code", "Department"],
+            disabled=["Staff Key", "Staff Name", "Base Home", "Source", "Confidence", "Employee Code", "Department", "Note"],
             column_config={
                 "Base Nominal": st.column_config.TextColumn("Base Nominal", help="Enter a nominal such as 208, 404, 504 to override."),
             },
             key="base_editor",
         )
         if st.button("Save staff base overrides"):
-            errors = save_staff_overrides_from_df(edited_base, st.session_state.overrides)
+            errors = save_staff_overrides_from_df(edited_base, st.session_state.overrides, base_table)
             if errors:
                 st.error("\n".join(errors))
             else:
@@ -674,7 +481,7 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
                 st.success("Staff base overrides saved for this session.")
                 st.rerun()
         if not missing_base.empty:
-            st.error(f"{len(missing_base)} staff member(s) still need a base home.")
+            st.error(f"{len(missing_base)} staff member(s) still need a valid, mapped base home.")
 
     with detail_tab:
         render_section("Review detail", "Inspect the rows that will feed the final workbook.")
@@ -760,9 +567,13 @@ with tempfile.TemporaryDirectory() as temp_dir_name:
                 )
                 st.session_state.report_bytes = output_path.read_bytes()
                 st.session_state.report_name = output_path.name
+                st.session_state.report_sig = report_signature(review_df, st.session_state.mapping_text)
                 st.success("Report generated.")
 
-        if st.session_state.report_bytes:
+        report_is_current = ready and st.session_state.report_sig == report_signature(review_df, st.session_state.mapping_text)
+        if st.session_state.report_bytes and not report_is_current:
+            st.warning("The earlier report no longer matches the current inputs. Generate it again.")
+        if st.session_state.report_bytes and report_is_current:
             st.download_button(
                 "Download Excel report",
                 data=st.session_state.report_bytes,
