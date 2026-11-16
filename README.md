@@ -48,3 +48,13 @@ pip install -r requirements.txt -r requirements-dev.txt
 python -m pytest
 ```
 Tests use fictional data only.
+
+## Department costing page
+
+`pages/1_Department_Costing.py` (logic in `department_costing.py`) re-splits cost between homes after wages are posted.
+
+- **Pool rules** - a shared department or role (e.g. kitchen suffix `05`, paying homes CRE+PET, 50/50). All matching lines are pooled, then split by the shares.
+- **Person rules** - one person across homes by percentage or days (2/2/1 days = 40/40/20%). These override pool rules.
+- Shares are normalised, so percentages and days both work. Rules can be saved/loaded as JSON.
+- Output: net journal (credit nominal -> debit nominal per cost type), allocation detail, staff included, and warnings. Lines with no nominal code are listed, never allocated.
+- Payroll names ("Surname Forename X") are matched to the staff master by words; an ambiguous or unmatched name is flagged, not guessed.
