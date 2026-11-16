@@ -555,6 +555,28 @@ def build_review_rows(
     return review_df, transfer_df, nominal_df, staff_df
 
 
+def final_transfer_table(transfer_df: pd.DataFrame) -> pd.DataFrame:
+    """Period / From / To / NIC / Wages - the layout shared with Finance. A cost type
+    with no movement is left blank rather than 0."""
+    cols = ["Period", "Transfer From", "Transfer To", "NIC", "Wages"]
+    if transfer_df is None or transfer_df.empty:
+        return pd.DataFrame(columns=cols)
+    wide = transfer_df.pivot_table(
+        index=["Period", "Transfer From", "Transfer To"], columns="Cost Type", values="Amount", aggfunc="sum"
+    ).reset_index()
+    wide = wide.rename(columns={"WAGES": "Wages"})
+    for col in ("NIC", "Wages"):
+        if col not in wide:
+            wide[col] = float("nan")
+    wide = (
+        wide.assign(_p=pd.to_numeric(wide["Period"], errors="coerce"))
+        .sort_values(["_p", "Transfer From", "Transfer To"])
+        .drop(columns="_p")
+    )
+    wide[["NIC", "Wages"]] = wide[["NIC", "Wages"]].round(2)
+    return wide[cols].reset_index(drop=True)
+
+
 def autosize_and_style(filename: Path) -> None:
     wb = load_workbook(filename)
     header_fill = PatternFill("solid", fgColor="1F4E78")
@@ -610,6 +632,7 @@ def write_output(
     overrides: Dict[str, str],
 ) -> Path:
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        final_transfer_table(transfer_df).to_excel(writer, sheet_name="Final_Transfers", index=False)
         review_df.to_excel(writer, sheet_name="OTHER_Review", index=False)
         transfer_df.to_excel(writer, sheet_name="Transfer_Summary", index=False)
         nominal_df.to_excel(writer, sheet_name="Nominal_Summary", index=False)

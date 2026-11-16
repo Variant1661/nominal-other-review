@@ -20,7 +20,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -337,10 +337,21 @@ def build_costing(
     rules: List[Rule],
     mapping: Dict[str, str],
     master: Dict[str, List[Dict[str, str]]],
+    exclude_rows: Optional[Set[int]] = None,
 ) -> Dict[str, pd.DataFrame]:
+    """`exclude_rows`: payroll row numbers already moved by an OTHER-line transfer.
+    They are left out of the rules so no line is transferred twice."""
     reverse = {v: k for k, v in mapping.items()}
     assigned, warnings = assign_rules(lines, rules, master)
     rule_by_name = {r.name: r for r in rules}
+    exclude = exclude_rows or set()
+    skipped = [lines[i] for i in assigned if lines[i].row_no in exclude]
+    if skipped:
+        names = sorted({assigned[i] for i in assigned if lines[i].row_no in exclude})
+        warnings.append({"Rule": ", ".join(names), "Issue": (
+            f"{len(skipped)} line(s) totalling \u00a3{sum(x.amount for x in skipped):,.2f} were left out of the rules "
+            "because they are already moved by an OTHER-line transfer.")})
+    assigned = {i: r for i, r in assigned.items() if lines[i].row_no not in exclude}
 
     groups: Dict[Tuple[str, str, str, str], List[CostLine]] = defaultdict(list)
     for i, ln in enumerate(lines):
@@ -391,14 +402,39 @@ def build_costing(
     summary = (jdf.groupby(["Rule", "From Home", "To Home"], as_index=False)["Amount"].sum().round(2)
                if not jdf.empty else pd.DataFrame(columns=["Rule", "From Home", "To Home", "Amount"]))
     return {
-        "journal": jdf, "summary": summary, "detail": pd.DataFrame(detail),
+        "journal": jdf, "summary": summary, "rule_table": rule_transfer_table(jdf), "detail": pd.DataFrame(detail),
         "people": people_df, "warnings": pd.DataFrame(warnings, columns=["Rule", "Issue"]),
     }
 
 
+def rule_transfer_table(journal: pd.DataFrame) -> pd.DataFrame:
+    """Rule transfers in the same Period / From / To layout, one column per cost type."""
+    cols = ["Period", "Rule", "From Home", "To Home", "NIC", "Pension", "Wages"]
+    if journal.empty:
+        return pd.DataFrame(columns=cols)
+    wide = journal.pivot_table(index=["Period", "Rule", "From Home", "To Home"], columns="Cost Type",
+                               values="Amount", aggfunc="sum").reset_index()
+    wide = wide.rename(columns={"PENSION": "Pension", "WAGES": "Wages"})
+    for c in ("NIC", "Pension", "Wages"):
+        if c not in wide:
+            wide[c] = float("nan")
+    wide = (wide.assign(_p=pd.to_numeric(wide["Period"], errors="coerce"))
+            .sort_values(["_p", "Rule", "From Home", "To Home"]).drop(columns="_p"))
+    return wide[cols].round(2)
+
+
 # ----------------------------------------------------------------- output --
 
-def write_costing_workbook(path: Path, result: Dict[str, pd.DataFrame], rules: List[Rule], no_code: List[Dict[str, Any]], mapping: Dict[str, str]) -> Path:
+def write_costing_workbook(
+    path: Path,
+    result: Dict[str, pd.DataFrame],
+    rules: List[Rule],
+    no_code: List[Dict[str, Any]],
+    mapping: Dict[str, str],
+    final_transfers: Optional[pd.DataFrame] = None,
+) -> Path:
+    """Sheet order: Final_Transfers (regular OTHER-line transfers, ready to share), then the
+    new rules kept separate (Rule_Transfers, Journal, Allocation_Detail ...)."""
     from nominal_logic import autosize_and_style
 
     rule_rows = []
@@ -410,7 +446,10 @@ def write_costing_workbook(path: Path, result: Dict[str, pd.DataFrame], rules: L
             "Split": ", ".join(f"{h} {s * 100:.2f}%" for h, s in share.items()), "Note": r.note,
         })
     with pd.ExcelWriter(path, engine="openpyxl") as w:
-        result["summary"].to_excel(w, sheet_name="Transfer_Summary", index=False)
+        if final_transfers is not None:
+            final_transfers.to_excel(w, sheet_name="Final_Transfers", index=False)
+        result["rule_table"].to_excel(w, sheet_name="Rule_Transfers", index=False)
+        result["summary"].to_excel(w, sheet_name="Rule_Summary", index=False)
         result["journal"].to_excel(w, sheet_name="Journal", index=False)
         result["detail"].to_excel(w, sheet_name="Allocation_Detail", index=False)
         result["people"].to_excel(w, sheet_name="Staff_Included", index=False)
