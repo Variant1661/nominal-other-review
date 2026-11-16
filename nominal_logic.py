@@ -47,6 +47,9 @@ PAYROLL_LINE_RE = re.compile(
 )
 
 
+OTHER_WORD_RE = re.compile(r"\bOTHERS?\b", re.IGNORECASE)
+
+
 @dataclass
 class ParsedLine:
     row_no: int
@@ -96,7 +99,8 @@ def validate_nominal(value: Any) -> Tuple[bool, str]:
     return True, code
 
 
-def clean_amount(value: Any) -> float:
+def clean_amount(value: Any, strict: bool = False) -> float:
+    """Blank is 0.0. Text that is not a number is 0.0, or a ValueError when strict."""
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
@@ -109,6 +113,8 @@ def clean_amount(value: Any) -> float:
     try:
         return float(text)
     except ValueError:
+        if strict:
+            raise ValueError(f"unreadable amount {str(value)!r}")
         return 0.0
 
 
@@ -126,7 +132,7 @@ def staff_lookup_keys(name: str) -> List[str]:
     base = staff_key(name)
     tokens = [t for t in base.split() if t]
     no_initials = [t for t in tokens if len(t) > 1]
-    keys = {base, staff_token_key(name), " ".join(no_initials), " ".join(sorted(no_initials))}
+    keys = {" ".join(no_initials), " ".join(sorted(no_initials))}
     if len(no_initials) >= 2:
         keys.add(f"{no_initials[0]} {no_initials[1]}")
         keys.add(f"{no_initials[-1]} {no_initials[0]}")
@@ -135,7 +141,13 @@ def staff_lookup_keys(name: str) -> List[str]:
             a, b = no_initials[i], no_initials[i + 1]
             keys.add(f"{a} {b}")
             keys.add(f"{b} {a}")
-    return [k for k in keys if k]
+    # exact name first, then the weaker variants in a stable order
+    ordered = [base, staff_token_key(name)] + sorted(keys)
+    return [k for k in dict.fromkeys(ordered) if k]
+
+
+def strong_lookup_keys(name: str) -> List[str]:
+    return [k for k in dict.fromkeys([staff_key(name), staff_token_key(name)]) if k]
 
 
 def normalise_home(value: Any) -> str:
@@ -160,7 +172,7 @@ def amount_from_debit_credit(debit: float, credit: float) -> float:
 
 
 def is_other_category(category: str) -> bool:
-    return "OTHER" in category.upper()
+    return bool(OTHER_WORD_RE.search(category))
 
 
 def parse_description(
@@ -240,16 +252,20 @@ def read_csv_rows(path: Path) -> List[List[Any]]:
 
 def read_excel_rows(path: Path) -> List[List[Any]]:
     wb = load_workbook(path, data_only=True, read_only=True)
-    ws = wb.active
-    return [list(row) for row in ws.iter_rows(values_only=True)]
+    try:
+        return [list(row) for row in wb.active.iter_rows(values_only=True)]
+    finally:
+        wb.close()
 
 
 def read_lines(input_file: Path) -> List[ParsedLine]:
+    """Parse payroll lines. A row with no Code keeps a blank nominal (it is never
+    inherited from the row above), so it reaches the missing-nominal queue."""
     rows = read_csv_rows(input_file) if input_file.suffix.lower() == ".csv" else read_excel_rows(input_file)
     header_idx = find_header_row(rows)
     cols = detect_columns(rows[header_idx])
     lines: List[ParsedLine] = []
-    last_nominal = ""
+    bad_amounts: List[str] = []
 
     for zero_idx, row in enumerate(rows[header_idx + 1 :], start=header_idx + 1):
         excel_row = zero_idx + 1
@@ -260,20 +276,27 @@ def read_lines(input_file: Path) -> List[ParsedLine]:
                 return ""
             return row[col]
 
-        raw_nominal = clean_nominal(get("code"))
-        if raw_nominal:
-            last_nominal = raw_nominal
+        if not PAYROLL_LINE_RE.match(clean_text(get("description"))):
+            continue
+        try:
+            debit = clean_amount(get("debit"), strict=True)
+            credit = clean_amount(get("credit"), strict=True)
+        except ValueError as exc:
+            bad_amounts.append(f"row {excel_row}: {exc}")
+            continue
         parsed = parse_description(
             row_no=excel_row,
-            nominal=raw_nominal or last_nominal,
+            nominal=clean_nominal(get("code")),
             reference=get("reference"),
-            debit=clean_amount(get("debit")),
-            credit=clean_amount(get("credit")),
+            debit=debit,
+            credit=credit,
             desc_value=get("description"),
             source_file=input_file.name,
         )
         if parsed:
             lines.append(parsed)
+    if bad_amounts:
+        raise ValueError("Could not read amounts, fix the export and upload again: " + "; ".join(bad_amounts[:10]))
     return lines
 
 
@@ -299,14 +322,26 @@ def detect_staff_master_columns(rows: List[List[Any]]) -> Tuple[int, Dict[str, i
 
 
 def load_staff_master(master_file: Optional[Path], mapping: Dict[str, str]) -> Dict[str, Dict[str, str]]:
+    """Lookup key -> staff record. Full-name keys are strong and never overwritten by
+    weaker variants. A key claimed by two different people is marked ambiguous."""
     if not master_file or not master_file.exists():
         return {}
     wb = load_workbook(master_file, data_only=True, read_only=True)
-    ws_name = "List Data" if "List Data" in wb.sheetnames else wb.sheetnames[0]
-    ws = wb[ws_name]
-    rows = [list(row) for row in ws.iter_rows(values_only=True)]
+    try:
+        ws_name = "List Data" if "List Data" in wb.sheetnames else wb.sheetnames[0]
+        rows = [list(row) for row in wb[ws_name].iter_rows(values_only=True)]
+    finally:
+        wb.close()
     header_idx, cols = detect_staff_master_columns(rows)
-    result: Dict[str, Dict[str, str]] = {}
+    strong: Dict[str, Dict[str, str]] = {}
+    weak: Dict[str, Dict[str, str]] = {}
+
+    def put(table: Dict[str, Dict[str, str]], key: str, item: Dict[str, str]) -> None:
+        old = table.get(key)
+        if old is not None and (old["master_staff_name"], old["employee_code"]) != (item["master_staff_name"], item["employee_code"]):
+            table[key] = {**old, "ambiguous": "1"}
+        else:
+            table[key] = item
 
     for row in rows[header_idx + 1 :]:
         def get(col_name: str) -> str:
@@ -330,9 +365,13 @@ def load_staff_master(master_file: Optional[Path], mapping: Dict[str, str]) -> D
             "base_home": base_home,
             "department": department,
             "source": master_source,
+            "ambiguous": "",
         }
+        for k in strong_lookup_keys(full_name):
+            put(strong, k, item)
         for k in staff_lookup_keys(full_name):
-            result[k] = item
+            if k not in strong_lookup_keys(full_name):
+                put(weak, k, item)
 
         surname = get("surname")
         forename = get("forename")
@@ -340,8 +379,8 @@ def load_staff_master(master_file: Optional[Path], mapping: Dict[str, str]) -> D
             first_forename = forename.split()[0] if forename else ""
             for candidate in [f"{forename} {surname}", f"{surname} {forename}", f"{first_forename} {surname}", f"{surname} {first_forename}"]:
                 for k in staff_lookup_keys(candidate):
-                    result[k] = item
-    return result
+                    put(weak, k, item)
+    return {**weak, **strong}
 
 
 def review_lines(lines: Iterable[ParsedLine]) -> List[ParsedLine]:
@@ -369,16 +408,21 @@ def infer_staff_base(
         if line.is_other:
             display.setdefault(key, line.staff_name)
         if should_use_for_base(line):
-            totals[key][line.nominal_code] += abs(line.amount)
+            totals[key][line.nominal_code] += line.amount
 
     result: Dict[str, Dict[str, Any]] = {}
     for key, name in display.items():
         override = clean_nominal(overrides.get(key, ""))
         master: Dict[str, str] = {}
+        note = ""
         for lookup_key in staff_lookup_keys(name):
             found_master = staff_master.get(lookup_key)
             if found_master:
+                if found_master.get("ambiguous"):
+                    note = "Name matches more than one staff master record - not used"
+                    continue
                 master = found_master
+                note = ""
                 break
 
         source = "UNKNOWN"
@@ -415,12 +459,14 @@ def infer_staff_base(
             "amount_used_for_inference": total_used,
             "employee_code": clean_text(master.get("employee_code", "")) if master else "",
             "department": clean_text(master.get("department", "")) if master else "",
+            "note": note,
         }
     return result
 
 
 def missing_nominal_key(line: ParsedLine) -> str:
-    return f"{line.staff_key}|{line.category}|P{line.period}|{round(abs(line.amount), 2)}|{'NIC' if line.is_nic else 'WAGES'}"
+    # row number + file make the key unique even for identical lines and reversals
+    return f"{line.source_file}|r{line.row_no}|{line.staff_key}|{line.category}|P{line.period}|{'NIC' if line.is_nic else 'WAGES'}"
 
 
 def apply_missing_nominals(lines: List[ParsedLine], corrections: Dict[str, str]) -> None:
@@ -475,7 +521,7 @@ def build_review_rows(
             "Base Home": base_home,
             "Transfer From": base_home if status == "TRANSFER_TO_OTHER_HOME" else "",
             "Transfer To": other_home if status == "TRANSFER_TO_OTHER_HOME" else "",
-            "Amount": round(abs(line.amount), 2),
+            "Amount": round(line.amount, 2),
             "Debit": line.debit,
             "Credit": line.credit,
             "Description": line.description,
@@ -493,7 +539,9 @@ def build_review_rows(
             .groupby(["Period", "Transfer From", "Transfer To", "Cost Type"], dropna=False)["Amount"]
             .sum()
             .reset_index()
-            .sort_values(["Period", "Transfer From", "Transfer To", "Cost Type"])
+            .assign(_p=lambda d: pd.to_numeric(d["Period"], errors="coerce"))
+            .sort_values(["_p", "Transfer From", "Transfer To", "Cost Type"])
+            .drop(columns="_p")
         )
     nominal_df = pd.DataFrame()
     if not review_df.empty:
